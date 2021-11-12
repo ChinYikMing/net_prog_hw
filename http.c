@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -26,7 +27,7 @@
         goto label; \
     } while(0)
 
-#define PORT 8080
+#define PORT 80
 #define MAX_BACKLOG 50
 #define BUF_SIZE 1024
 #define CRLF "\r\n"
@@ -37,7 +38,7 @@ typedef struct str_buf {
   size_t size;     /* the already used size */
 } Sb;
 static int sb_init(Sb *buf, unsigned cap_bits);
-static int sb_empty(Sb *buf);
+static int sb_clear(Sb *buf);
 static int sb_parse_http_req_header(Sb *buf);
 static int sb_gen_http_res(Sb *res, Sb *req);
 static int sb_putc(Sb *buf, char c);
@@ -53,17 +54,17 @@ typedef struct http_pyld {
     Sb pyld_sb;
 } HTTPPyld;
 
-typedef void (*http_method)(HTTPHdr *hdr, HTTPPyld *pyld);
-typedef void (*http_parser)(const char *msg);
-
 typedef struct http_msg {
     HTTPHdr hdr;
     HTTPPyld pyld;
-    Sb strbuf;    // for receiving request and parse them into hdr and pyld
-    http_method get;
-    http_method post;
-    http_parser parse;
 } HTTPMsg;
+
+static void httpmsg_parse(HTTPMsg *msg, const char *buf);
+static void http_get_handler(int connfd, HTTPMsg *msg);
+static void http_post_handler(int connfd, HTTPMsg *msg);
+static void signup(HTTPMsg *msg); // redirect to login page
+static void login(HTTPMsg *msg); // redirect to index page
+static char *get_content_type(char *req_tgt);
 
 static void conn_handler(int connfd);
 
@@ -100,13 +101,14 @@ int main(){
             case -1: // error
                 err_handle("fork", again);
 
-            case 0:
+            case 0: // child
                 close(listenfd); // unnecessary fd
                 conn_handler(connfd);
                 exit(0);
 
             default: // parent
-                break; // goto accept another connection
+                close(connfd); // unnecessary fd
+                break;
         }
     }
 
@@ -114,42 +116,202 @@ int main(){
     exit(1);
 }
 
-static void http_get_handler(HTTPHdr *hdr, HTTPPyld *pyld){
-
-}
-
-static void http_post_handler(HTTPHdr *hdr, HTTPPyld *pyld){
-
-}
-
 static void conn_handler(int connfd){
-    Sb buf;
-    sb_init(&buf, 5);
+    char tmp_buf[BUF_SIZE];
+    memset(tmp_buf, 0, sizeof(char[BUF_SIZE]));
 
-    int fd = open("./public/index.html", O_RDONLY);
-    struct stat sb;
-    fstat(fd, &sb);
-    char cont[sb.st_size];
-    read(fd, cont, sb.st_size);
+    HTTPMsg msg;
+    sb_init(&msg.hdr.hdr_sb, 5);
+    sb_init(&msg.pyld.pyld_sb, 5);
 
-    sb_puts(&buf, "HTTP/1.1 200 OK");
-    sb_putn(&buf, CRLF, 2);
-    sb_puts(&buf, "Content-Type: text/html; charset=utf-8");
-    sb_putn(&buf, CRLF, 2);
-    sb_puts(&buf, "Content-Length: 105");
-    sb_putn(&buf, CRLF, 2);
-    sb_puts(&buf, "Date: Sat, 18 Feb 2017 00:01:57 GMT");
-    sb_putn(&buf, CRLF, 2);
-    sb_puts(&buf, "Server: cool ming server");
-    sb_putn(&buf, CRLF, 2);
-    sb_puts(&buf, "Connection: close");
-    sb_putn(&buf, CRLF, 2);
-    sb_putn(&buf, CRLF, 2);
-    sb_putn(&buf, cont, sb.st_size);
+    ssize_t recv_size;
+    long content_len = -1;
+    char *ptr, *qtr;
+    _Bool is_get = false;     // only support get and post method
+    while(1){
+    next:
+        // get header
+        recv_size = recv(connfd, tmp_buf, BUF_SIZE, 0);
+        is_get = (tmp_buf[0] == 'G' ? true : false);
+        while(!strstr(tmp_buf, CRLF CRLF)){
+        again:
+            if(recv_size <= 0){
+                if(recv_size == -1)
+                    err_handle("recv header", again);
+                if(recv_size == 0){            // peer socket shutdown early
+                    sb_clear(&msg.hdr.hdr_sb);
+                    goto next;
+                }
+            }
+            sb_puts(&msg.hdr.hdr_sb, tmp_buf);
+            if((ptr = strstr(tmp_buf, "Content-Length")) && 
+                (qtr = strstr(ptr, CRLF))){     // fixme: if the content length and CRLF are cut
+                content_len = strtol(ptr, NULL, 10);
+            }
+            recv_size = recv(connfd, tmp_buf, BUF_SIZE, 0);
+        }
 
-    send(connfd, sb_flush(&buf), buf.size, 0);
+        sb_puts(&msg.hdr.hdr_sb, tmp_buf); // header last line which includes CRLF CRLF
 
+        // get payload
+        if(content_len != -1 && content_len != 0){
+            char tbuf[content_len + 1];
+            memset(tbuf, 0, sizeof(char[content_len + 1]));
+        pyldagain:
+            recv_size = recv(connfd, tbuf, content_len, 0);
+            if(recv_size <= 0){
+                if(recv_size == -1)
+                    err_handle("recv payload", pyldagain);
+                if(recv_size == 0){            // peer socket shutdown early
+                    sb_clear(&msg.pyld.pyld_sb);
+                    goto next;
+                }
+            }
+
+            sb_puts(&msg.pyld.pyld_sb, tbuf);
+        }
+
+        if(is_get)
+            http_get_handler(connfd, &msg);
+        else
+            http_post_handler(connfd, &msg);
+    }
     close(connfd);
+}
+
+static void httpmsg_parse(HTTPMsg *msg, const char *buf){
+
+}
+
+static void http_get_handler(int connfd, HTTPMsg *msg){
+    char buf[BUF_SIZE];
+    memset(buf, 0, sizeof(char[BUF_SIZE]));
+    ssize_t send_size;
+
+    // get request target
+    Sb req_tgt_path_buf;
+    sb_init(&req_tgt_path_buf, 5);
+    sb_putc(&req_tgt_path_buf, '.');
+    char *ptr = strstr(msg->hdr.hdr_sb.val, "/");
+    char *qtr = strstr(ptr, " "); 
+    sb_putn(&req_tgt_path_buf, ptr, qtr - ptr);
+
+    char *req_tgt_path = sb_flush(&req_tgt_path_buf);
+    int req_tgt_fd = open(req_tgt_path, O_RDONLY);
+    int _404_fd;
+
+    struct stat req_tgt_stat;
+    char time_buf[100];
+    strftime(time_buf, 100, "%a %b %d %T %Y", localtime(&(time_t){time(NULL)}));
+    Sb res_hdr_buf;
+    sb_init(&res_hdr_buf, 5);
+    char *res_hdr;
+    if(req_tgt_fd == -1){ // 404 not found
+        // build response header
+        sb_puts(&res_hdr_buf, "HTTP/1.1 404 Not Found");
+        sb_puts(&res_hdr_buf, CRLF);
+
+        sb_puts(&res_hdr_buf, "Content-Type: text/html; charset=utf-8");
+        sb_puts(&res_hdr_buf, CRLF);
+
+        sb_puts(&res_hdr_buf, "Date: ");
+        sb_puts(&res_hdr_buf, time_buf);
+        sb_puts(&res_hdr_buf, CRLF);
+
+        sb_puts(&res_hdr_buf, "Server: ming cool server");
+        sb_puts(&res_hdr_buf, CRLF);
+
+    openagain:
+       _404_fd = open("./404.html", O_RDONLY);
+       if(_404_fd == -1)
+            err_handle("open", openagain);
+       fstat(_404_fd, &req_tgt_stat);
+       sprintf(buf, "%ld", req_tgt_stat.st_size);
+       sb_puts(&res_hdr_buf, "Content-Length: ");
+       sb_puts(&res_hdr_buf, buf);
+       sb_puts(&res_hdr_buf, CRLF);
+       sb_puts(&res_hdr_buf, CRLF);
+
+        res_hdr = sb_flush(&res_hdr_buf);
+    notfound:
+        send_size = send(connfd, res_hdr, res_hdr_buf.size, 0);
+        if(send_size == -1)
+            err_handle("send response header(404)", notfound);
+
+        // send response payload
+        while(read(_404_fd, buf, BUF_SIZE) > 0){
+        send404again:
+            send_size = send(connfd, buf, BUF_SIZE, 0);
+            if(send_size == -1)
+                err_handle("send response payload(404)", send404again);
+        }
+        close(_404_fd);
+    } else { // found
+        // build response header
+        sb_puts(&res_hdr_buf, "HTTP/1.1 200 OK");
+        sb_puts(&res_hdr_buf, CRLF);
+
+        sb_puts(&res_hdr_buf, "Date: ");
+        sb_puts(&res_hdr_buf, time_buf);
+        sb_puts(&res_hdr_buf, CRLF);
+
+        sb_puts(&res_hdr_buf, "Server: ming cool server");
+        sb_puts(&res_hdr_buf, CRLF);
+
+        char *ctt = get_content_type(req_tgt_path);
+        sb_puts(&res_hdr_buf, ctt);
+        sb_puts(&res_hdr_buf, CRLF);
+        free(ctt);
+
+        fstat(req_tgt_fd, &req_tgt_stat);
+        sprintf(buf, "%ld", req_tgt_stat.st_size);
+        sb_puts(&res_hdr_buf, "Content-Length: ");
+        sb_puts(&res_hdr_buf, buf);
+        sb_puts(&res_hdr_buf, CRLF);
+        sb_puts(&res_hdr_buf, CRLF);
+
+        res_hdr = sb_flush(&res_hdr_buf);
+    found:
+        send_size = send(connfd, res_hdr, res_hdr_buf.size, 0);
+        if(send_size == -1)
+            err_handle("send response header(found)", found);
+
+        // send response payload
+        while(read(req_tgt_fd, buf, BUF_SIZE) > 0){
+        sendreqtgtagain:
+            send_size = send(connfd, buf, BUF_SIZE, 0);
+            if(send_size == -1)
+                err_handle("send response payload(found)", sendreqtgtagain);
+        }
+        close(req_tgt_fd);
+    }
+eof:
+    send_size = send(connfd, CRLF, 2, 0);
+    if(send_size == -1)
+        err_handle("send CRLF", eof);
+
+end:
+    free(res_hdr);
+    free(req_tgt_path);
+    return;
+}
+
+static void signup(HTTPMsg *msg){
+
+}
+
+static void login(HTTPMsg *msg){
+
+}
+
+static void http_post_handler(int connfd, HTTPMsg *msg){
+    if(strstr(msg->hdr.hdr_sb.val, "login")){
+        login(msg);
+    } else if(strstr(msg->hdr.hdr_sb.val, "register")){
+        signup(msg);
+    } else { // upload 
+
+    }
 }
 
 static int sb_init(Sb *buf, unsigned cap_bits){
@@ -228,8 +390,21 @@ again:
   return ret;
 }
 
-static int sb_empty(Sb *buf){
+static int sb_clear(Sb *buf){
     *(buf->val) = '\0';
     buf->size = 0;
     return 0;
+}
+
+static char *get_content_type(char *req_tgt){
+    Sb buf;
+    sb_init(&buf, 5);
+    if(strstr(req_tgt, ".jpg") || strstr(req_tgt, ".png") || strstr(req_tgt, ".jpeg"))
+        sb_puts(&buf, "Content-Type: image/jpg");
+    else if(strstr(req_tgt, ".gif"))
+        sb_puts(&buf, "Content-Type: image/gif");
+    else 
+        sb_puts(&buf, "Content-Type: text/html; charset=utf-8");
+
+    return sb_flush(&buf);
 }
