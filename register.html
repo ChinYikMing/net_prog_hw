@@ -37,18 +37,6 @@ button:hover {
   background-color: #f44336;
 }
 
-/* Center the image and position the close button */
-/* .imgcontainer {
-  text-align: center;
-  margin: 24px 0 12px 0;
-  position: relative;
-}
-
-img.avatar {
-  width: 40%;
-  border-radius: 50%;
-} */
-
 .container {
   padding: 16px;
 }
@@ -76,7 +64,7 @@ span.psw {
 /* Modal Content/Box */
 .modal-content {
   background-color: #fefefe;
-  margin: 10% auto 15% auto; /* 10% from the top, 15% from the bottom and centered */
+  margin: 12% auto 15% auto; /* 12% from the top, 15% from the bottom and centered */
   border: 1px solid #888;
   width: 80%; /* Could be more or less, depending on screen size */
 }
@@ -126,7 +114,6 @@ span.psw {
 
 html {
     background-image: url("http://localhost/public/img/htmlbg.jpg");
-    /* background-image: url("https://svitla.com/uploads_converted/0/2135-database_management_software.webp?1560161553"); */
     background-size: cover;
     background-repeat: no-repeat;
 }
@@ -151,13 +138,13 @@ body {
 
 <div id="id01" class="modal">
   
-  <form class="modal-content animate" action="/register" method="post">
+  <form class="modal-content animate" action="./register.html" method="post">
     <div class="container">
       <label for="uname"><b>Username</b></label>
-      <input type="text" placeholder="Enter Username" name="uname" required>
+      <input type="text" placeholder="Enter Username" name="uname" required maxlength="10">
 
       <label for="psw"><b>Password</b></label>
-      <input type="password" placeholder="Enter Password" name="psw" required>
+      <input type="password" placeholder="Enter Password" name="psw" required maxlength="8">
         
       <button type="submit">Create Account</button>
     </div>

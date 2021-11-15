@@ -91,6 +91,11 @@ span.psw {
   font-weight: bold;
 }
 
+li {
+  font-size: 20px;
+  margin-top: 15px;
+}
+
 .close:hover,
 .close:focus {
   color: red;
@@ -126,6 +131,7 @@ span.psw {
 
 html {
     background-image: url("http://localhost/public/img/htmlbg.jpg");
+    /* background-image: url("https://svitla.com/uploads_converted/0/2135-database_management_software.webp?1560161553"); */
     background-size: cover;
     background-repeat: no-repeat;
 }
@@ -140,45 +146,21 @@ body {
     justify-content: center;
     align-items: center;
 }
+
+#id01 {
+    display: block;
+}
 </style>
+<script>
+  function redirect2main(){
+    window.location.replace("http://localhost/main.html");
+  }
+</script>
 </head>
 <body>
 
-<!-- <h2>Modal Login Form</h2> -->
-
-<button onclick="document.getElementById('id01').style.display='block'" style="width:auto;">Get started</button>
-
 <div id="id01" class="modal">
   
-  <form class="modal-content animate" action="/login" method="post">
+  <form class="modal-content animate" action="./register.html" method="post">
     <div class="container">
-      <label for="uname"><b>Username</b></label>
-      <input type="text" placeholder="Enter Username" name="uname" required>
-
-      <label for="psw"><b>Password</b></label>
-      <input type="password" placeholder="Enter Password" name="psw" required>
-        
-      <button type="submit">Login</button>
-    </div>
-
-    <div class="container" style="background-color:#f1f1f1">
-      <button type="button" onclick="document.getElementById('id01').style.display='none'" class="cancelbtn">Cancel</button>
-      <span class="psw"><a href="./register.html">Create Account </a></span>
-    </div>
-  </form>
-</div>
-
-<script>
-// Get the modal
-var modal = document.getElementById('id01');
-
-// When the user clicks anywhere outside of the modal, close it
-window.onclick = function(event) {
-    if (event.target == modal) {
-        modal.style.display = "none";
-    }
-}
-</script>
-
-</body>
-</html>
+      <ul>
