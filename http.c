@@ -32,7 +32,7 @@
 #define PORT 80
 #define MAX_BACKLOG 50
 #define MAX_CONTENT_LENGTH 0x10000  // 1MB
-#define BUF_SIZE 4096
+#define BUF_SIZE 8192
 #define CRLF "\r\n"
 
 typedef struct str_buf {
@@ -47,16 +47,8 @@ static int sb_putn(Sb *buf, char *src, size_t n);
 static int sb_puts(Sb *buf, char *src);
 static char *sb_flush(Sb *buf);
 
-typedef struct client_info {
-    char *name;
-    char *nounce;
-} ClientInfo;
-static void clinfo_init(ClientInfo *clinfo);
-static void clinfo_destroy(ClientInfo *clinfo);
-
 typedef struct http_msg {
     Sb buf;
-    ClientInfo clinfo;
 } HTTPMsg;
 
 static _Bool http_get_handler(int connfd, HTTPMsg *msg);
@@ -65,14 +57,17 @@ static void http_err_send(int connfd, int code, int hdr_cnt, ...);
 static void http_resrc_send(int connfd, int code, char *req_tgt_path, int hdr_cnt, ...);
 static void http_redirect_send(int connfd, int code, char *redirection, int hdr_cnt, ...);
 
-static _Bool signup(HTTPMsg *msg);
+static int signup(HTTPMsg *msg);
 static _Bool login(HTTPMsg *msg);
 static _Bool file_upload(HTTPMsg *msg);
-static void get_uname_psw(HTTPMsg *msg, char *uname, char *psw);
+static void get_uname_psw_from_msg(HTTPMsg *msg, char *uname, char *psw);
 static char *get_content_type(char *req_tgt);
 static char *code2msg(int code);
 static char *get_cookie(HTTPMsg *msg);
-static char *cookie_gen(char *username);
+static char *get_uname_from_cookie(char *cookie);
+static _Bool check_nounce(char *cookie);
+static void save_uname_nounce(char *uname, char *nounce);
+static char *nounce_gen(char *username);
 static void conn_handler(int connfd);
 
 int main(){
@@ -132,18 +127,13 @@ static void conn_handler(int connfd){
 
     HTTPMsg msg;
     sb_init(&msg.buf, 5);
-    clinfo_init(&msg.clinfo);
 
     char *ptr, *qtr;
     _Bool is_get = false;     // only support get and post method
     _Bool success;
 
-    // FILE *conn_fptr = fdopen(connfd, "r");   // for recv line by line
     while(1){
     next:
-        if(strstr(msg.buf.val, "login")){
-            printf("in conn: %p, strlen: %zu\n", &msg, strlen(msg.clinfo.name));
-        }
         sb_clear(&msg.buf);
 
         // get header
@@ -171,27 +161,22 @@ static void conn_handler(int connfd){
         } else {
             success = http_post_handler(connfd, &msg);
             if(!success){
-                printf("failed postt!\n");
+                printf("failed post!\n");
                 goto end;
             }
         }
     }
 end:
-    if(strstr(msg.buf.val, "login"))
-        printf(" early end here\n");
-    // fclose(conn_fptr);
+    printf("end!\n");
     free(sb_flush(&msg.buf));
-    clinfo_destroy(&msg.clinfo);
     close(connfd);
     return;
 }
 
-static _Bool signup(HTTPMsg *msg){
+static int signup(HTTPMsg *msg){
     char uname[11] = {0};
     char psw[9] = {0};
-    get_uname_psw(msg, uname, psw);
-
-    strcpy(msg->clinfo.name, "aooke");
+    get_uname_psw_from_msg(msg, uname, psw);
 
     // check if any same username exists
     DIR *dir_user = opendir("./users/");
@@ -199,12 +184,14 @@ static _Bool signup(HTTPMsg *msg){
 
     while((entry_user = readdir(dir_user))){
         if(strcmp(entry_user->d_name, uname) == 0)
-            return false;
+            return 1;
     }
 
-    // username valid
     int direcfd = dirfd(dir_user);
-    mkdirat(direcfd, uname, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+    if(direcfd == -1)
+        return 2;
+    if(mkdirat(direcfd, uname, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IRWXO) == -1)
+        return 2;
 
     int shadowfd = open("./shadow", O_APPEND | O_WRONLY);
     char rec_new[32] = {0};
@@ -216,13 +203,13 @@ static _Bool signup(HTTPMsg *msg){
 
     close(shadowfd);
     close(direcfd);
-    return true;
+    return 0;
 }
 
 static _Bool login(HTTPMsg *msg){
     char uname[11] = {0};
     char psw[9] = {0};
-    get_uname_psw(msg, uname, psw);
+    get_uname_psw_from_msg(msg, uname, psw);
 
     char rec[32] = {0}; // post request login record
     strcpy(rec, uname);
@@ -239,13 +226,6 @@ static _Bool login(HTTPMsg *msg){
             buf[buf_len - 1] = 0; 
 
         if(strcmp(buf, rec) == 0){
-            // msg->clinfo.name for upload file and view list of uploaded files
-            strcpy((msg->clinfo).name, uname);
-            // gen cookie for page protection
-            char *cookie = cookie_gen(uname);
-            strcpy((msg->clinfo).nounce, cookie);
-            free(cookie);
-
             fclose(shadow_fptr);
             return true;
         }
@@ -273,88 +253,72 @@ static _Bool http_post_handler(int connfd, HTTPMsg *msg){
 
     _Bool is_authorized = false;
     _Bool success;
-    Sb res_hdr_buf;
 
     if(strstr(msg->buf.val, "login")){ // login
         success = login(msg);
+
         if(success){
-            // fixme: cookie
-            http_redirect_send(connfd, 303, "/main.html", 1, "Set-Cookie: auth=abc123");
-            printf("after login: %p, strlen: %zu\n", msg, strlen(msg->clinfo.name));
-        } else { 
+            char uname[11] = {0};
+            char psw[9] = {0};
+            get_uname_psw_from_msg(msg, uname, psw);
+
+            char cookie1[64] = {0}; // nounce
+            strcpy(cookie1, "Set-Cookie: ");
+            char *nounce = nounce_gen(uname);
+            strcat(cookie1, "auth=");
+            strcat(cookie1, nounce);
+
+            char cookie2[64] = {0}; // uname
+            strcpy(cookie2, "Set-Cookie: ");
+            strcat(cookie2, "uname=");
+            strcat(cookie2, uname);
+
+            save_uname_nounce(uname, nounce);
+            free(nounce);
+
+            http_redirect_send(connfd, 303, "/main.html", 2, cookie1, cookie2);
+        } else 
             http_redirect_send(connfd, 303, "/login_failed.html", 0);
-        }
     } else if(strstr(msg->buf.val, "register")){ // register
-        success = signup(msg);
-        if(success) {
-            http_redirect_send(connfd, 303, "/register_success.html", 0);
-        } else { 
+        int ret;
+        ret = signup(msg);
+        if(ret == 1)
             http_redirect_send(connfd, 303, "/register_failed.html", 0);
-        }
+        else if(ret == 2)
+            http_err_send(connfd, 500, 0);
+        else {   // success
+            success = true;
+            http_redirect_send(connfd, 303, "/register_success.html", 0);
+        } 
     } else if(strstr(msg->buf.val, "upload")){ // upload
-        printf("upload: %p, strlen: %zu\n", msg, strlen(msg->clinfo.name));
-
-        // char *line_feed_ptr;
-        // char *filename_ptr = strstr(msg->buf.val, "filename");
-        // // get content type to separate binary or ascii
-        // char content_type[32];
-        // char *content_type_ptr;
-        // content_type_ptr = strstr(filename_ptr, "Content-Type: ") + 14;
-        // line_feed_ptr = strstr(content_type_ptr, CRLF);
-        // memcpy(content_type, content_type_ptr, line_feed_ptr - content_type_ptr);
-        // printf("%s\n", content_type);
-
         // get message body
         size_t recv_size_tot = 0;
         size_t recv_size;
         char buf[BUF_SIZE];
-            while(recv_size_tot < content_len){
-            iagain:
-                recv_size = recv(connfd, buf, BUF_SIZE, 0);
-                if(recv_size == -1)
-                    err_handle("recv message body", iagain);
-                sb_puts(&msg->buf, buf);
-                recv_size_tot += recv_size;
-            }
-            printf("recv_size: %zu\n", recv_size_tot);
-        // fixme if need rb
-        // if(strncmp(content_type, "image", 5) == 0){
-        //     printf("img here\n");
-        // } else if(strncmp(content_type, "text", 4) == 0){
-        //     printf("text here\n");
-        //     while(recv_size_tot < content_len){
-        //     tagain:
-        //         recv_size = recv(connfd, buf, BUF_SIZE, 0);
-        //         if(recv_size == -1)
-        //             err_handle("recv message body", tagain);
-        //         sb_puts(&msg->buf, buf);
-        //         recv_size_tot += recv_size;
-        //     }
-        //     printf("recv_size: %zu\n", recv_size_tot);
-        // } else { // unsupported content type
-        //     http_err_send(connfd, 406, 0);   
-        // }
+        while(recv_size_tot < content_len){
+            recv_size = recv(connfd, buf, BUF_SIZE, 0);
+            sb_puts(&msg->buf, buf);
+            recv_size_tot += recv_size;
+        }
+        printf("recv_size: %zu\n", recv_size_tot);
 
-        char *cookie = get_cookie(msg);
-        if(cookie && strcmp(cookie, msg->clinfo.nounce) == 0)
-            is_authorized = true;
-
+        is_authorized = check_nounce(get_cookie(msg));
         if(is_authorized){
             success = file_upload(msg);
-            http_redirect_send(connfd, 303, "/upload_success.html", 0);
-        } else {
+            if(success)
+                http_redirect_send(connfd, 303, "/upload_success.html", 0);
+            else
+                http_err_send(connfd, 500, 0);
+        } else
             http_err_send(connfd, 401, 0);
-        }
-
-        free(cookie);
     }    
-    printf("redirect fin: %p, strlen: %zu\n", msg, strlen(msg->clinfo.name));
     return success;
 }
 
 static _Bool file_upload(HTTPMsg *msg){
+    char *uname = get_uname_from_cookie(get_cookie(msg));
     char *hdr = sb_flush(&msg->buf);
-
+    
     // get content length
     size_t content_len;
     content_len = strtol(strstr(hdr, "Content-Length") + 16, NULL, 10);
@@ -392,12 +356,16 @@ static _Bool file_upload(HTTPMsg *msg){
 
     // create file
     char file_dest[PATH_MAX] = "./users/";
-    char *username = msg->clinfo.name;
-    // fixme
-    // strcat(file_dest, username);
-    strcat(file_dest, "test/");
+    strcat(file_dest, uname);
+    strcat(file_dest, "/");
     strcat(file_dest, filename);
-    int newfd = open(file_dest, O_CREAT | O_RDWR | S_IRWXU | S_IRWXG);
+    free(uname);
+
+    int newfd = open(file_dest, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG);
+    if(newfd == -1){
+        free(hdr);
+        return false;
+    }
 
     // printf("file_dest: %s\n", file_dest);
     // printf("filename: %s\n", filename);
@@ -446,7 +414,6 @@ static _Bool file_upload(HTTPMsg *msg){
             content_start_ptr = line_feed_ptr + 2;
             memset(tmpbuf, 0, sizeof(char[4096]));
         }
-
     } else if(strncmp(content_type, "text", 4) == 0){
         while(1){
             line_feed_ptr = strstr(content_start_ptr, CRLF);
@@ -489,21 +456,42 @@ static _Bool http_get_handler(int connfd, HTTPMsg *msg){
     char *content_type = get_content_type(req_tgt_path);
     if(!content_type){
         http_err_send(connfd, 415, 0);
+        free(req_tgt_path);
         return false;
     }
 
     int req_tgt_fd = open(req_tgt_path, O_RDONLY);
-    // 404 not found except view.html and download
-    if(req_tgt_fd == -1 && !strstr(req_tgt_path, "view") && !strstr(req_tgt_path, "download")){
+    // 404 not found except view.html and download and logout
+    if(req_tgt_fd == -1 && !strstr(req_tgt_path, "view") && 
+        !strstr(req_tgt_path, "download") && !strstr(req_tgt_path, "logout")){
         http_err_send(connfd, 404, 0);
+        free(req_tgt_path);
         return false;
     } 
     
     // page protection
     if(strstr(content_type, "html") || strstr(content_type, "plain")){
         char *cookie = get_cookie(msg);
-        if(cookie) {
-            if(strstr(req_tgt_path, "download")){
+        if(cookie && check_nounce(cookie)) {
+            if(strstr(req_tgt_path, "logout")){
+                // set expire of cookie and redirect
+                char *uname = get_uname_from_cookie(get_cookie(msg));
+                char cookie1[64] = {0}; // nounce
+                strcpy(cookie1, "Set-Cookie: ");
+                char *nounce = nounce_gen(uname);
+                strcat(cookie1, "auth=");
+                strcat(cookie1, nounce);
+                strcat(cookie1, "; expires=Thu, 01 Jan 1970 00:00:00 GMT");
+                free(nounce);
+
+                char cookie2[64] = {0}; // uname
+                strcpy(cookie2, "Set-Cookie: ");
+                strcat(cookie2, "uname=");
+                strcat(cookie2, uname);
+                strcat(cookie2, "; expires=Thu, 01 Jan 1970 00:00:00 GMT");
+
+                http_redirect_send(connfd, 303, "/index.html", 2, cookie1, cookie2);
+            } else if(strstr(req_tgt_path, "download")){
                 char download_tgt[PATH_MAX];
                 memset(download_tgt, 0, sizeof(char[PATH_MAX]));
                 char *download_tgt_ptr = strstr(msg->buf.val, "/download/") + 10;
@@ -517,11 +505,31 @@ static _Bool http_get_handler(int connfd, HTTPMsg *msg){
                     strcpy(content_dispo_hdr, "Content-Disposition: attachment; filename=");
                     strcat(content_dispo_hdr, basename(download_tgt));
                     http_resrc_send(connfd, 200, download_tgt, 1, content_dispo_hdr);
+                    goto end;
                 }
             } else if(strstr(req_tgt_path, "main") || strstr(req_tgt_path, "index")){
                 http_resrc_send(connfd, 200, "./main.html", 0);
             } else if(strstr(req_tgt_path, "view")){
-                int view_fd = open("./view.html", O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG);
+                char *cookie = get_cookie(msg);
+                char *uname = get_uname_from_cookie(cookie);
+
+                char user_dir_path[32];
+                strcpy(user_dir_path, "./users/");
+                strcat(user_dir_path, uname);
+                strcat(user_dir_path, "/");
+
+                char user_view_path[32];
+                strcpy(user_view_path, user_dir_path);
+                strcat(user_view_path, "/");
+                strcat(user_view_path, "view.html");
+
+                int view_fd = open(user_view_path, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG);
+                if(view_fd == -1){
+                    http_err_send(connfd, 500, 0);
+                    free(uname);
+                    return false;
+                }
+
                 char buf[BUF_SIZE];
                 ssize_t read_size;
 
@@ -532,12 +540,6 @@ static _Bool http_get_handler(int connfd, HTTPMsg *msg){
                 close(view_hdr_fd);
 
                 // view body
-                char user_dir_path[32];
-                strcpy(user_dir_path, "./users/");
-                strcat(user_dir_path, "test");
-                // fixme
-                // strcat(user_dir_path, msg->clinfo.name);
-
                 DIR *dir_user = opendir(user_dir_path);
                 struct dirent *e;
                 char *li_tag_start = "<li><a href=\"http://localhost/download/";
@@ -546,46 +548,47 @@ static _Bool http_get_handler(int connfd, HTTPMsg *msg){
                 size_t li_tag_end_len = strlen(li_tag_end);
 
                 while((e = readdir(dir_user))){
-                    if(strncmp(e->d_name, ".", 1) == 0 || strncmp(e->d_name, "..", 2) == 0)
+                    if(strncmp(e->d_name, ".", 1) == 0 || 
+                        strncmp(e->d_name, "..", 2) == 0 ||
+                        strncmp(e->d_name, "view.html", 9) == 0)
                         continue;
                     write(view_fd, li_tag_start, li_tag_start_len);
                     write(view_fd, "users/", 6);
-                    // fixme:
-                    write(view_fd, "test/", 5);
+                    write(view_fd, uname, strlen(uname));
+                    write(view_fd, "/", 1);
                     write(view_fd, e->d_name, strlen(e->d_name));
                     write(view_fd, "\">", 2);
                     write(view_fd, e->d_name, strlen(e->d_name));
                     write(view_fd, li_tag_end, li_tag_end_len);
                 }
+                free(uname);
 
                 // view footer
                 int view_ftr_fd = open("./view_footer.html", O_RDONLY);
                 while((read_size = read(view_ftr_fd, buf, BUF_SIZE)) > 0)
                     write(view_fd, buf, read_size);
-                close(view_ftr_fd);
 
                 closedir(dir_user);
                 close(view_fd);
+                close(view_ftr_fd);
 
-                http_resrc_send(connfd, 200, "view.html", 0);
-            } else { 
+                http_resrc_send(connfd, 200, user_view_path, 0);
+            } else
                 http_resrc_send(connfd, 200, req_tgt_path, 0);
-            }
-        } else if(!cookie || (strcmp(cookie, msg->clinfo.nounce) != 0)){
+        } else {
             if(strstr(req_tgt_path, "main") || 
                 strstr(req_tgt_path, "view") || strstr(req_tgt_path, "index"))
                 http_resrc_send(connfd, 200, "./index.html", 0);
-            else {
+            else
                 http_resrc_send(connfd, 200, req_tgt_path, 0);
-            }
         }
-    } else {
+    } else 
         http_resrc_send(connfd, 200, req_tgt_path, 0);
-    }
 
+    close(req_tgt_fd);
+end:
     free(content_type);
     free(req_tgt_path);
-    close(req_tgt_fd);
     return true;
 }
 
@@ -656,13 +659,9 @@ static char *sb_flush(Sb *buf){
     size++;
   }
 
-again:
-  ret = strdup(realloc(buf->val, size)); /* using strdup since realloc may remain the same region of memory */
-  if(!ret)
-    err_handle("sb_flush", again);
-
-  free(buf->val);
-  return ret;
+//   ret = strdup(realloc(buf->val, size)); /* using strdup since realloc may remain the same region of memory */
+//   free(buf->val);
+  return buf->val;
 }
 
 static void sb_clear(Sb *buf){
@@ -680,7 +679,7 @@ static char *get_content_type(char *req_tgt){
         sb_puts(&buf, "Content-Type: image/gif");
     else if(strstr(req_tgt, "html"))
         sb_puts(&buf, "Content-Type: text/html; charset=utf-8");
-    else if(strstr(req_tgt, "txt"))
+    else if(strstr(req_tgt, "txt") || strstr(req_tgt, "logout")) // for download and logout
         sb_puts(&buf, "Content-Type: text/plain; charset=utf-8");
     else if(strstr(req_tgt, "upload"))
         sb_puts(&buf, "upload");
@@ -729,6 +728,9 @@ static char *code2msg(int code){
         case 415:
             sb_puts(&ret, "Unsupported Media Type");
             break;
+        case 500:
+            sb_puts(&ret, "Internal Server Error");
+            break;
         default:
             break;
     }
@@ -767,9 +769,7 @@ static void http_err_send(int connfd, int code, int hdr_cnt, ...){
     sb_puts(&err_res_hdr_buf, CRLF);
 
     char *err_res_hdr = sb_flush(&err_res_hdr_buf);
-again:
-    if(send(connfd, err_res_hdr, err_res_hdr_buf.size, 0) == -1)
-        err_handle("err send", again);
+    send(connfd, err_res_hdr, err_res_hdr_buf.size, 0);
 
     free(msg);
     free(err_res_hdr);
@@ -831,17 +831,12 @@ static void http_resrc_send(int connfd, int code, char *req_tgt_path, int hdr_cn
 
     // send header
     char *res_hdr = sb_flush(&res_hdr_buf);
-again:
-    if(send(connfd, res_hdr, res_hdr_buf.size - 1, 0) == -1)
-        err_handle("err send", again);
+    send(connfd, res_hdr, res_hdr_buf.size - 1, 0);
 
     // send payload
     ssize_t read_size;
     while((read_size = read(req_tgt_fd, buf, BUF_SIZE)) > 0){
-    sendreqtgtagain:
-        send_size = send(connfd, buf, read_size, 0);
-        if(send_size != read_size)
-            err_handle("send response payload(found)", sendreqtgtagain);
+        send(connfd, buf, read_size, 0);
     }
 
     free(code_msg);
@@ -881,9 +876,7 @@ static void http_redirect_send(int connfd, int code, char *redirection, int hdr_
     sb_puts(&redirect_res_hdr_buf, CRLF);
 
     char *redirect_res_hdr = sb_flush(&redirect_res_hdr_buf);
-again:
-    if(send(connfd, redirect_res_hdr, redirect_res_hdr_buf.size, 0) == -1)
-        err_handle("err send", again);
+    send(connfd, redirect_res_hdr, redirect_res_hdr_buf.size, 0);
 
     free(msg);
     free(redirect_res_hdr);
@@ -891,40 +884,81 @@ again:
 }
 
 static char *get_cookie(HTTPMsg *msg){
-    char *cookie_ptr = strstr(msg->buf.val, "Cookie: ");
+    char *cookie_ptr = strstr(msg->buf.val, "Cookie");
     if(!cookie_ptr)
         return NULL;
+    return cookie_ptr;
+}
 
-    char *auth_ptr = strstr(cookie_ptr, "auth=");
-    if(!auth_ptr)
+static _Bool check_nounce(char *cookie){
+    char nounce[64] = {0};
+    char uname[64] = {0};
+
+    char *nounce_ptr = strstr(cookie, "auth=");
+    nounce_ptr += 5;
+    char *semicomma_ptr = strchr(nounce_ptr, ';');
+    memcpy(nounce, nounce_ptr, semicomma_ptr - nounce_ptr);
+
+    char *uname_ptr = strstr(cookie, "uname=");
+    uname_ptr += 6;
+    char *linefeed_ptr = strstr(uname_ptr, CRLF);
+    memcpy(uname, uname_ptr, linefeed_ptr - uname_ptr);
+
+    char nounce_rec[128];
+    strcpy(nounce_rec, uname);
+    strcat(nounce_rec, ":");
+    strcat(nounce_rec, nounce);
+
+    FILE *nounce_fptr = fopen("./nounce_shadow", "r");
+    if(!nounce_fptr)
         return NULL;
-    auth_ptr += 5;
 
-    char *linefeed_ptr = strstr(auth_ptr, CRLF);
+    char buf[BUF_SIZE];
+    size_t buf_len;
+    while(fgets(buf, BUF_SIZE, nounce_fptr)){
+        buf_len = strlen(buf);
+        if(buf_len && buf[buf_len - 1] == '\n')
+            buf[buf_len - 1] = 0;
 
-    char *auth_cookie = malloc(64);
-    memcpy(auth_cookie, auth_cookie, linefeed_ptr - auth_ptr);
+        if(strcmp(nounce_rec, buf) == 0){
+            fclose(nounce_fptr);
+            return true;
+        }
+    }
 
-    return auth_cookie;
+    fclose(nounce_fptr);
+    return false;
+}
+
+static void save_uname_nounce(char *uname, char *nounce){
+    char nounce_rec[128];
+    strcpy(nounce_rec, uname);
+    strcat(nounce_rec, ":");
+    strcat(nounce_rec, nounce);
+    strcat(nounce_rec, "\n");
+
+    int nounce_shadowfd = open("./nounce_shadow", O_APPEND | O_WRONLY);
+    write(nounce_shadowfd, nounce_rec, strlen(nounce_rec));
+
+    close(nounce_shadowfd);
+    return;
 }
 
 // simply +1 to each character of username
-static char *cookie_gen(char *username){
-    char *cookie = malloc(strlen(username) + 1);
-    strcpy(cookie, username);
-    for(size_t i = 0; i < strlen(cookie); ++i)
-        *(cookie + i) += 1;
-    return cookie;
+static char *nounce_gen(char *username){
+    char *nounce = malloc(strlen(username) + 1);
+    strcpy(nounce, username);
+    for(size_t i = 0; i < strlen(nounce); ++i)
+        *(nounce + i) += 1;
+    return nounce;
 }
 
-static void get_uname_psw(HTTPMsg *msg, char *uname, char *psw){
+static void get_uname_psw_from_msg(HTTPMsg *msg, char *uname, char *psw){
     char *uname_ptr;
     char *psw_ptr;
     char *ptr, *qtr;
     size_t content_len;
     content_len = strtol(strstr(msg->buf.val, "Content-Length") + 16, NULL, 10);
-
-    // printf("%s\n", msg->buf.val);
 
     uname_ptr = strstr(msg->buf.val, CRLF CRLF) + 10;
     ptr = strchr(uname_ptr, '&');
@@ -933,18 +967,21 @@ static void get_uname_psw(HTTPMsg *msg, char *uname, char *psw){
     memcpy(uname, uname_ptr, ptr - uname_ptr);
     content_len -= (6 + (ptr - uname_ptr) + 4);   // password length
     memcpy(psw, psw_ptr + 4, content_len);
+
+    // printf("uname: %s\n", uname);
+    // printf("psw: %s\n", psw);
 }
 
-static void clinfo_init(ClientInfo *clinfo){
-    clinfo->name = malloc(64);
-    memset(clinfo->name, 0, 64);
+static char *get_uname_from_cookie(char *cookie){
+    char *ret = malloc(16);
+    if(!ret)
+        return NULL;
+    memset(ret, 0, 16);
 
-    clinfo->nounce = malloc(16);
-    memset(clinfo->name, 0, 16);
-    return;
-}
+    char *uname_ptr = strstr(cookie, "uname=");
+    uname_ptr += 6;
+    char *linefeed_ptr = strstr(uname_ptr, CRLF);
+    memcpy(ret, uname_ptr, linefeed_ptr - uname_ptr);
 
-static void clinfo_destroy(ClientInfo *clinfo){
-    free(clinfo->name);
-    free(clinfo->nounce);
+    return ret;
 }
