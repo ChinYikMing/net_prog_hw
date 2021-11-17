@@ -101,10 +101,9 @@ int main(){
         if(connfd == -1)
             err_handle("accept", next);
 
-        again:
         switch(fork()){
             case -1: // error
-                err_handle("fork", again);
+                err_handle("fork", next);
 
             case 0: // child
                 close(listenfd); // unnecessary fd
