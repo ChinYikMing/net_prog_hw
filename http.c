@@ -31,8 +31,8 @@
 
 #define PORT 80
 #define MAX_BACKLOG 50
-#define MAX_CONTENT_LENGTH 0x10000  // 1MB
-#define BUF_SIZE 8192
+#define MAX_CONTENT_LENGTH 0x100000  // 1MB
+#define BUF_SIZE 4096
 #define CRLF "\r\n"
 
 typedef struct str_buf {
@@ -122,8 +122,7 @@ int main(){
 }
 
 static void conn_handler(int connfd){
-    char buf[BUF_SIZE];
-    memset(buf, 0, sizeof(char[BUF_SIZE]));
+    char buf[BUF_SIZE] = {0};
 
     HTTPMsg msg;
     sb_init(&msg.buf, 5);
@@ -294,7 +293,7 @@ static _Bool http_post_handler(int connfd, HTTPMsg *msg){
         // get message body
         size_t recv_size_tot = 0;
         size_t recv_size;
-        char buf[BUF_SIZE];
+        char buf[BUF_SIZE] = {0};
         while(recv_size_tot < content_len){
             recv_size = recv(connfd, buf, BUF_SIZE, 0);
             sb_puts(&msg->buf, buf);
@@ -327,8 +326,7 @@ static _Bool file_upload(HTTPMsg *msg){
     char *next_line_feed_ptr;
 
     // get end boundary (boundary + "--")
-    char boundary_end[BUF_SIZE];
-    memset(boundary_end, 0, sizeof(char[BUF_SIZE]));
+    char boundary_end[BUF_SIZE] = {0};
     memcpy(boundary_end, "--", 2);
     size_t boundary_len;
     char *boundary_ptr = strstr(hdr, "boundary=") + 9;
@@ -338,14 +336,20 @@ static _Bool file_upload(HTTPMsg *msg){
     strcat(boundary_end, "--");
     size_t boundary_end_len = boundary_len + 4;
 
+    // get content disposition
+    char content_dispo[BUF_SIZE] = {0};
+    char *content_dispo_ptr = strstr(hdr, "Content-Disposition");
+    line_feed_ptr = strstr(content_dispo_ptr, CRLF);
+    memcpy(content_dispo, content_dispo_ptr, line_feed_ptr - content_dispo_ptr);
+
     // get filename;
     char filename[PATH_MAX] = {0};
-    char *filename_ptr = strstr(hdr, "filename") + 10;
+    char *filename_ptr = strstr(content_dispo_ptr, "filename") + 10;
     char *quote_end_ptr = strchr(filename_ptr, '"');
     memcpy(filename, filename_ptr, quote_end_ptr - filename_ptr);
 
     // get content type to separate binary or ascii
-    char content_type[32];
+    char content_type[PATH_MAX] = {0};
     char *content_type_ptr;
     content_type_ptr = strstr(filename_ptr, "Content-Type: ") + 14;
     line_feed_ptr = strstr(content_type_ptr, CRLF);
@@ -353,6 +357,13 @@ static _Bool file_upload(HTTPMsg *msg){
 
     // get content start
     char *content_start_ptr = strstr(filename_ptr, CRLF CRLF) + 4;
+    // char tmpbuf[1024];
+    // snprintf(tmpbuf, 128, "%s", content_start_ptr);
+    // for(int i = 0; i < 128; ++i){
+    //     for(int j = i; j < i + 16; ++j)
+    //         printf("%X ", tmpbuf[j]);
+    //     printf("\n");
+    // }
 
     // create file
     char file_dest[PATH_MAX] = "./users/";
@@ -361,81 +372,41 @@ static _Bool file_upload(HTTPMsg *msg){
     strcat(file_dest, filename);
     free(uname);
 
-    int newfd = open(file_dest, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG);
-    if(newfd == -1){
-        free(hdr);
-        return false;
-    }
-
-    // printf("file_dest: %s\n", file_dest);
-    // printf("filename: %s\n", filename);
-    // printf("bound_end: %s\n", boundary_end);
-    // printf("%s", hdr);
-    // printf("%s", content_start_ptr);
-
     // write octets to newly created file
-    ssize_t write_size;
-    size_t to_write;
-    char tmpbuf[4096];
-
-    if(strncmp(content_type, "image", 5) == 0){
-        printf("content type: %s\n", content_type);
-        FILE *bin_fptr;
-    again:
-        bin_fptr = fdopen(newfd, "wb");
-        if(!bin_fptr)
-            err_handle("fdopen write binary", again);
-
-        while(1){
-            line_feed_ptr = strstr(content_start_ptr, CRLF);
-            next_line_feed_ptr = strstr(line_feed_ptr, CRLF);
-            to_write = line_feed_ptr - content_start_ptr + 2; // +2 for CRLF
-
-            if(strncmp(next_line_feed_ptr + 2, boundary_end, boundary_end_len) == 0){
-                to_write -= 2; //skip last line
-                fwrite(content_start_ptr, sizeof *content_start_ptr, to_write, bin_fptr);
-                printf("CRLF double\n");
-                break;
-            }
-            
-            fwrite(content_start_ptr, sizeof *content_start_ptr, to_write, bin_fptr);
-            snprintf(tmpbuf, to_write, "%s", line_feed_ptr);
-            size_t count = to_write;
-            char *ptr = tmpbuf;
-            while(count > 0){
-                for(int i = 0; i < 16; ++i){
-                    printf("%x ", (unsigned int) (*(ptr + i)));
-                }
-                printf("\n");
-                ptr += 16;
-                count -= 16;
-            }
-
-            content_start_ptr = line_feed_ptr + 2;
-            memset(tmpbuf, 0, sizeof(char[4096]));
+    if(strncmp(content_type, "image", 5) == 0 || 
+        strncmp(content_type, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", strlen("application/vnd.openxmlformats-officedocument.wordprocessingml.document")) == 0){
+        FILE *dest_fptr = fopen(file_dest, "wb");
+        if(!dest_fptr){
+            free(hdr);
+            return false;
         }
+        size_t real_content_len = content_len - boundary_end_len - (boundary_end_len + 2) - strlen(content_type) - strlen(content_dispo) - 22; // 22 is CRLF
+        fwrite(content_start_ptr, 1, real_content_len, dest_fptr);
+        fclose(dest_fptr);
     } else if(strncmp(content_type, "text", 4) == 0){
+        int newfd = open(file_dest, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG);
+        if(newfd == -1){
+            free(hdr);
+            return false;
+        }
+
+        ssize_t write_size;
+        size_t to_write;
         while(1){
             line_feed_ptr = strstr(content_start_ptr, CRLF);
             next_line_feed_ptr = strstr(line_feed_ptr, CRLF);
             to_write = line_feed_ptr - content_start_ptr + 2; // +2 for CRLF
-
             if(strncmp(next_line_feed_ptr + 2, boundary_end, boundary_end_len) == 0){
                 to_write -= 2; //skip last line
                 write(newfd, content_start_ptr, to_write);
                 break;
             }
-            
             write(newfd, content_start_ptr, to_write);
-            // snprintf(tmpbuf, to_write, "%s", line_feed_ptr);
-            // printf("%s\n", tmpbuf);
-
             content_start_ptr = line_feed_ptr + 2;
-            // memset(tmpbuf, 0, sizeof(char[4096]));
         }
+        close(newfd);
     } 
 
-    close(newfd);
     free(hdr);
     return true;
 }
@@ -460,130 +431,130 @@ static _Bool http_get_handler(int connfd, HTTPMsg *msg){
         return false;
     }
 
+    if(strstr(req_tgt_path, "view") || strstr(req_tgt_path, "logout") || strstr(req_tgt_path, "download"))
+        goto serve;
+
+    // 404 not found
     int req_tgt_fd = open(req_tgt_path, O_RDONLY);
-    // 404 not found except view.html and download and logout
-    if(req_tgt_fd == -1 && !strstr(req_tgt_path, "view") && 
-        !strstr(req_tgt_path, "download") && !strstr(req_tgt_path, "logout")){
+    if(req_tgt_fd == -1){
         http_err_send(connfd, 404, 0);
         free(req_tgt_path);
         return false;
     } 
-    
+
+    char *cookie;
     // page protection
-    if(strstr(content_type, "html") || strstr(content_type, "plain")){
-        char *cookie = get_cookie(msg);
-        if(cookie && check_nounce(cookie)) {
-            if(strstr(req_tgt_path, "logout")){
-                // set expire of cookie and redirect
-                char *uname = get_uname_from_cookie(get_cookie(msg));
-                char cookie1[64] = {0}; // nounce
-                strcpy(cookie1, "Set-Cookie: ");
-                char *nounce = nounce_gen(uname);
-                strcat(cookie1, "auth=");
-                strcat(cookie1, nounce);
-                strcat(cookie1, "; expires=Thu, 01 Jan 1970 00:00:00 GMT");
-                free(nounce);
+serve:
+    cookie = get_cookie(msg);
+    if(cookie && check_nounce(cookie)) {
+        if(strstr(req_tgt_path, "logout")){
+            // set expire of cookie and redirect
+            char *uname = get_uname_from_cookie(get_cookie(msg));
+            char cookie1[64] = {0}; // nounce
+            strcpy(cookie1, "Set-Cookie: ");
+            char *nounce = nounce_gen(uname);
+            strcat(cookie1, "auth=");
+            strcat(cookie1, nounce);
+            strcat(cookie1, "; expires=Thu, 01 Jan 1970 00:00:00 GMT");
+            free(nounce);
 
-                char cookie2[64] = {0}; // uname
-                strcpy(cookie2, "Set-Cookie: ");
-                strcat(cookie2, "uname=");
-                strcat(cookie2, uname);
-                strcat(cookie2, "; expires=Thu, 01 Jan 1970 00:00:00 GMT");
+            char cookie2[64] = {0}; // uname
+            strcpy(cookie2, "Set-Cookie: ");
+            strcat(cookie2, "uname=");
+            strcat(cookie2, uname);
+            strcat(cookie2, "; expires=Thu, 01 Jan 1970 00:00:00 GMT");
 
-                http_redirect_send(connfd, 303, "/index.html", 2, cookie1, cookie2);
-            } else if(strstr(req_tgt_path, "download")){
-                char download_tgt[PATH_MAX];
-                memset(download_tgt, 0, sizeof(char[PATH_MAX]));
-                char *download_tgt_ptr = strstr(msg->buf.val, "/download/") + 10;
-                char *space = strchr(download_tgt_ptr, ' ');
-                memcpy(download_tgt, download_tgt_ptr, space - download_tgt_ptr);
+            http_redirect_send(connfd, 303, "/index.html", 2, cookie1, cookie2);
+        } else if(strstr(req_tgt_path, "download")){
+            char download_tgt[PATH_MAX] = {0};
+            char *download_tgt_ptr = strstr(msg->buf.val, "/download/") + 10;
+            char *space = strchr(download_tgt_ptr, ' ');
+            memcpy(download_tgt, download_tgt_ptr, space - download_tgt_ptr);
 
-                if(access(download_tgt, F_OK) == ENOENT)
-                    http_err_send(connfd, 400, 0);
-                else {
-                    char content_dispo_hdr[PATH_MAX];
-                    strcpy(content_dispo_hdr, "Content-Disposition: attachment; filename=");
-                    strcat(content_dispo_hdr, basename(download_tgt));
-                    http_resrc_send(connfd, 200, download_tgt, 1, content_dispo_hdr);
-                    goto end;
-                }
-            } else if(strstr(req_tgt_path, "main") || strstr(req_tgt_path, "index")){
-                http_resrc_send(connfd, 200, "./main.html", 0);
-            } else if(strstr(req_tgt_path, "view")){
-                char *cookie = get_cookie(msg);
-                char *uname = get_uname_from_cookie(cookie);
+            if(access(download_tgt, F_OK) == ENOENT)
+                http_err_send(connfd, 400, 0);
+            else {
+                char content_dispo_hdr[PATH_MAX] = {0};
+                strcpy(content_dispo_hdr, "Content-Disposition: attachment; filename=");
+                strcat(content_dispo_hdr, basename(download_tgt));
+                http_resrc_send(connfd, 200, download_tgt, 1, content_dispo_hdr);
+                goto end;
+            }
+        }  else if(strstr(req_tgt_path, "view")){
+            char *cookie = get_cookie(msg);
+            char *uname = get_uname_from_cookie(cookie);
 
-                char user_dir_path[32];
-                strcpy(user_dir_path, "./users/");
-                strcat(user_dir_path, uname);
-                strcat(user_dir_path, "/");
+            char user_dir_path[32];
+            strcpy(user_dir_path, "./users/");
+            strcat(user_dir_path, uname);
+            strcat(user_dir_path, "/");
 
-                char user_view_path[32];
-                strcpy(user_view_path, user_dir_path);
-                strcat(user_view_path, "/");
-                strcat(user_view_path, "view.html");
+            char user_view_path[32];
+            strcpy(user_view_path, user_dir_path);
+            strcat(user_view_path, "/");
+            strcat(user_view_path, "view.html");
 
-                int view_fd = open(user_view_path, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG);
-                if(view_fd == -1){
-                    http_err_send(connfd, 500, 0);
-                    free(uname);
-                    return false;
-                }
-
-                char buf[BUF_SIZE];
-                ssize_t read_size;
-
-                // view header
-                int view_hdr_fd = open("./view_header.html", O_RDONLY);
-                while((read_size = read(view_hdr_fd, buf, BUF_SIZE)) > 0)
-                    write(view_fd, buf, read_size);
-                close(view_hdr_fd);
-
-                // view body
-                DIR *dir_user = opendir(user_dir_path);
-                struct dirent *e;
-                char *li_tag_start = "<li><a href=\"http://localhost/download/";
-                char *li_tag_end = "</a></li>";
-                size_t li_tag_start_len = strlen(li_tag_start);
-                size_t li_tag_end_len = strlen(li_tag_end);
-
-                while((e = readdir(dir_user))){
-                    if(strncmp(e->d_name, ".", 1) == 0 || 
-                        strncmp(e->d_name, "..", 2) == 0 ||
-                        strncmp(e->d_name, "view.html", 9) == 0)
-                        continue;
-                    write(view_fd, li_tag_start, li_tag_start_len);
-                    write(view_fd, "users/", 6);
-                    write(view_fd, uname, strlen(uname));
-                    write(view_fd, "/", 1);
-                    write(view_fd, e->d_name, strlen(e->d_name));
-                    write(view_fd, "\">", 2);
-                    write(view_fd, e->d_name, strlen(e->d_name));
-                    write(view_fd, li_tag_end, li_tag_end_len);
-                }
+            int view_fd = open(user_view_path, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG);
+            if(view_fd == -1){
+                http_err_send(connfd, 500, 0);
                 free(uname);
+                return false;
+            }
 
-                // view footer
-                int view_ftr_fd = open("./view_footer.html", O_RDONLY);
-                while((read_size = read(view_ftr_fd, buf, BUF_SIZE)) > 0)
-                    write(view_fd, buf, read_size);
+            char buf[BUF_SIZE] = {0};
+            ssize_t read_size;
 
-                closedir(dir_user);
-                close(view_fd);
-                close(view_ftr_fd);
+            // view header
+            int view_hdr_fd = open("./view_header.html", O_RDONLY);
+            while((read_size = read(view_hdr_fd, buf, BUF_SIZE)) > 0)
+                write(view_fd, buf, read_size);
+            close(view_hdr_fd);
 
-                http_resrc_send(connfd, 200, user_view_path, 0);
-            } else
-                http_resrc_send(connfd, 200, req_tgt_path, 0);
-        } else {
-            if(strstr(req_tgt_path, "main") || 
-                strstr(req_tgt_path, "view") || strstr(req_tgt_path, "index"))
-                http_resrc_send(connfd, 200, "./index.html", 0);
-            else
-                http_resrc_send(connfd, 200, req_tgt_path, 0);
-        }
-    } else 
-        http_resrc_send(connfd, 200, req_tgt_path, 0);
+            // view body
+            DIR *dir_user = opendir(user_dir_path);
+            struct dirent *e;
+            char *li_tag_start = "<li><a href=\"http://localhost/download/";
+            char *li_tag_end = "</a></li>";
+            size_t li_tag_start_len = strlen(li_tag_start);
+            size_t li_tag_end_len = strlen(li_tag_end);
+
+            while((e = readdir(dir_user))){
+                if(strncmp(e->d_name, ".", 1) == 0 || 
+                    strncmp(e->d_name, "..", 2) == 0 ||
+                    strncmp(e->d_name, "view.html", 9) == 0)
+                    continue;
+                write(view_fd, li_tag_start, li_tag_start_len);
+                write(view_fd, "users/", 6);
+                write(view_fd, uname, strlen(uname));
+                write(view_fd, "/", 1);
+                write(view_fd, e->d_name, strlen(e->d_name));
+                write(view_fd, "\">", 2);
+                write(view_fd, e->d_name, strlen(e->d_name));
+                write(view_fd, li_tag_end, li_tag_end_len);
+            }
+            free(uname);
+
+            // view footer
+            int view_ftr_fd = open("./view_footer.html", O_RDONLY);
+            while((read_size = read(view_ftr_fd, buf, BUF_SIZE)) > 0)
+                write(view_fd, buf, read_size);
+
+            closedir(dir_user);
+            close(view_fd);
+            close(view_ftr_fd);
+
+            http_resrc_send(connfd, 200, user_view_path, 0);
+        } else if(strstr(req_tgt_path, "main") || strstr(req_tgt_path, "index"))
+            http_resrc_send(connfd, 200, "./main.html", 0);
+        else
+            http_resrc_send(connfd, 200, req_tgt_path, 0);
+    } else {
+        if(strstr(req_tgt_path, "main") || 
+            strstr(req_tgt_path, "view") || strstr(req_tgt_path, "index"))
+            http_resrc_send(connfd, 200, "./index.html", 0);
+        else
+            http_resrc_send(connfd, 200, req_tgt_path, 0);
+    }
 
     close(req_tgt_fd);
 end:
@@ -673,20 +644,24 @@ static void sb_clear(Sb *buf){
 static char *get_content_type(char *req_tgt){
     Sb buf;
     sb_init(&buf, 5);
-    if(strstr(req_tgt, ".jpg") || strstr(req_tgt, ".png") || strstr(req_tgt, ".jpeg"))
+    if(strstr(req_tgt, ".jpg") || strstr(req_tgt, ".png") || strstr(req_tgt, ".jpeg") || strstr(req_tgt, ".ico"))
         sb_puts(&buf, "Content-Type: image/jpeg");
     else if(strstr(req_tgt, ".gif"))
         sb_puts(&buf, "Content-Type: image/gif");
-    else if(strstr(req_tgt, "html"))
+    else if(strstr(req_tgt, ".docx"))
+        sb_puts(&buf, "Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    else if(strstr(req_tgt, ".html"))
         sb_puts(&buf, "Content-Type: text/html; charset=utf-8");
-    else if(strstr(req_tgt, "txt") || strstr(req_tgt, "logout")) // for download and logout
+    else if(strstr(req_tgt, ".txt")) 
         sb_puts(&buf, "Content-Type: text/plain; charset=utf-8");
     else if(strstr(req_tgt, "upload"))
         sb_puts(&buf, "upload");
-    else { // unsupport type
-        free(sb_flush(&buf));
+    else if(strstr(req_tgt, "download"))
+        sb_puts(&buf, "download");
+    else if(strstr(req_tgt, "logout"))
+        sb_puts(&buf, "logout");
+    else // unsupport type
         return NULL;
-    }
 
     return sb_flush(&buf);
 }
@@ -698,9 +673,6 @@ static char *code2msg(int code){
         case 200:
             sb_puts(&ret, "OK");
             break;
-        // case 201:
-        //     sb_puts(&ret, "Created");
-        //     break;
         case 303:
             sb_puts(&ret, "See Other");
             break;
@@ -715,9 +687,6 @@ static char *code2msg(int code){
             break;
         case 405:
             sb_puts(&ret, "Method Not Allowed");
-            break;
-        case 406:
-            sb_puts(&ret, "Not Acceptable");
             break;
         case 411:
             sb_puts(&ret, "Length Required");
@@ -777,8 +746,7 @@ static void http_err_send(int connfd, int code, int hdr_cnt, ...){
 }
 
 static void http_resrc_send(int connfd, int code, char *req_tgt_path, int hdr_cnt, ...){
-    char buf[BUF_SIZE];
-    memset(buf, 0, sizeof(char[BUF_SIZE]));
+    char buf[BUF_SIZE] = {0};
     ssize_t send_size;
 
     char *code_msg = code2msg(code);
@@ -835,9 +803,8 @@ static void http_resrc_send(int connfd, int code, char *req_tgt_path, int hdr_cn
 
     // send payload
     ssize_t read_size;
-    while((read_size = read(req_tgt_fd, buf, BUF_SIZE)) > 0){
+    while((read_size = read(req_tgt_fd, buf, BUF_SIZE)) > 0)
         send(connfd, buf, read_size, 0);
-    }
 
     free(code_msg);
     free(res_hdr);
@@ -913,7 +880,7 @@ static _Bool check_nounce(char *cookie){
     if(!nounce_fptr)
         return NULL;
 
-    char buf[BUF_SIZE];
+    char buf[BUF_SIZE] = {0};
     size_t buf_len;
     while(fgets(buf, BUF_SIZE, nounce_fptr)){
         buf_len = strlen(buf);
@@ -967,9 +934,6 @@ static void get_uname_psw_from_msg(HTTPMsg *msg, char *uname, char *psw){
     memcpy(uname, uname_ptr, ptr - uname_ptr);
     content_len -= (6 + (ptr - uname_ptr) + 4);   // password length
     memcpy(psw, psw_ptr + 4, content_len);
-
-    // printf("uname: %s\n", uname);
-    // printf("psw: %s\n", psw);
 }
 
 static char *get_uname_from_cookie(char *cookie){
