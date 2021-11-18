@@ -8,4 +8,4 @@
 
 ### Features
 1. login interface
-2. upload & download txt, doc, pdf, image
+2. upload & download txt, doc, pdf, image(gif, png, jpg)
