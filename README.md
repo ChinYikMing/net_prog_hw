@@ -5,3 +5,7 @@
 2. cd to the cloned repo
 3. make
 4. sudo ./http
+
+### Features
+1. login interface
+2. upload & download txt, doc, pdf, image
