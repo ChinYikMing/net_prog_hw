@@ -31,7 +31,7 @@
 
 #define PORT 80
 #define MAX_BACKLOG 50
-#define MAX_CONTENT_LENGTH 0x100000  // 1MB
+#define MAX_CONTENT_LENGTH 0x3200000  // 50MB
 #define BUF_SIZE 4096
 #define CRLF "\r\n"
 
@@ -60,14 +60,14 @@ static void http_redirect_send(int connfd, int code, char *redirection, int hdr_
 static int signup(HTTPMsg *msg);
 static _Bool login(HTTPMsg *msg);
 static _Bool file_upload(HTTPMsg *msg);
-static void get_uname_psw_from_msg(HTTPMsg *msg, char *uname, char *psw);
-static char *get_content_type(char *req_tgt);
-static char *code2msg(int code);
 static char *get_cookie(HTTPMsg *msg);
+static void get_uname_psw_from_msg(HTTPMsg *msg, char *uname, char *psw);
+static char *get_content_type_from_path(char *req_tgt);
 static char *get_uname_from_cookie(char *cookie);
 static _Bool check_nounce(char *cookie);
 static void save_uname_nounce(char *uname, char *nounce);
 static char *nounce_gen(char *username);
+static char *code2msg(int code);
 static void conn_handler(int connfd);
 
 int main(){
@@ -129,14 +129,15 @@ static void conn_handler(int connfd){
     char *ptr, *qtr;
     _Bool is_get = false;     // only support get and post method
     _Bool success;
+    ssize_t recv_size;
 
     while(1){
     next:
         sb_clear(&msg.buf);
 
         // get header
-        while(recv(connfd, buf, BUF_SIZE, 0)){
-            sb_puts(&msg.buf, buf);
+        while((recv_size = recv(connfd, buf, BUF_SIZE, 0))){
+            sb_putn(&msg.buf, buf, recv_size);
             if(strstr(msg.buf.val, CRLF CRLF))  // reach double CRLF
                 break;
         }
@@ -165,7 +166,6 @@ static void conn_handler(int connfd){
         }
     }
 end:
-    printf("end!\n");
     free(sb_flush(&msg.buf));
     close(connfd);
     return;
@@ -295,7 +295,7 @@ static _Bool http_post_handler(int connfd, HTTPMsg *msg){
         char buf[BUF_SIZE] = {0};
         while(recv_size_tot < content_len){
             recv_size = recv(connfd, buf, BUF_SIZE, 0);
-            sb_puts(&msg->buf, buf);
+            sb_putn(&msg->buf, buf, recv_size);
             recv_size_tot += recv_size;
         }
         printf("recv_size: %zu\n", recv_size_tot);
@@ -347,22 +347,22 @@ static _Bool file_upload(HTTPMsg *msg){
     char *quote_end_ptr = strchr(filename_ptr, '"');
     memcpy(filename, filename_ptr, quote_end_ptr - filename_ptr);
 
+    // get content type includes header
+    char content_type_hdr[BUF_SIZE] = {0};
+    char *content_type_hdr_ptr;
+    content_type_hdr_ptr = strstr(filename_ptr, "Content-Type: ");
+    line_feed_ptr = strstr(content_type_hdr_ptr, CRLF);
+    memcpy(content_type_hdr, content_type_hdr_ptr, line_feed_ptr - content_type_hdr_ptr);
+
     // get content type to separate binary or ascii
-    char content_type[PATH_MAX] = {0};
+    char content_type[BUF_SIZE] = {0};
     char *content_type_ptr;
-    content_type_ptr = strstr(filename_ptr, "Content-Type: ") + 14;
+    content_type_ptr = content_type_hdr_ptr + 14;
     line_feed_ptr = strstr(content_type_ptr, CRLF);
     memcpy(content_type, content_type_ptr, line_feed_ptr - content_type_ptr);
 
     // get content start
     char *content_start_ptr = strstr(filename_ptr, CRLF CRLF) + 4;
-    // char tmpbuf[1024];
-    // snprintf(tmpbuf, 128, "%s", content_start_ptr);
-    // for(int i = 0; i < 128; ++i){
-    //     for(int j = i; j < i + 16; ++j)
-    //         printf("%X ", tmpbuf[j]);
-    //     printf("\n");
-    // }
 
     // create file
     char file_dest[PATH_MAX] = "./users/";
@@ -372,16 +372,23 @@ static _Bool file_upload(HTTPMsg *msg){
     free(uname);
 
     // write octets to newly created file
-    if(strncmp(content_type, "image", 5) == 0 || 
+    if(strncmp(content_type, "image", 5) == 0 || strncmp(content_type, "application/msword", strlen("application/msword")) == 0 ||
+        strncmp(content_type, "application/octet-stream", strlen("application/octet-stream")) == 0 || 
+        strncmp(content_type, "application/pdf", strlen("application/pdf")) == 0 ||
         strncmp(content_type, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", strlen("application/vnd.openxmlformats-officedocument.wordprocessingml.document")) == 0){
-        FILE *dest_fptr = fopen(file_dest, "wb");
-        if(!dest_fptr){
+        int newfd = open(file_dest, O_TRUNC | O_RDWR | O_CREAT, S_IRWXU | S_IRWXG);
+        if(newfd == -1){
             free(hdr);
             return false;
         }
-        size_t real_content_len = content_len - boundary_end_len - (boundary_end_len + 2) - strlen(content_type) - strlen(content_dispo) - 22; // 22 is CRLF
-        fwrite(content_start_ptr, 1, real_content_len, dest_fptr);
-        fclose(dest_fptr);
+
+        // printf("%s\n", content_dispo);
+        // printf("%s\n", content_type_hdr);
+        // printf("%s\n", boundary_end);
+        size_t real_content_len = content_len - boundary_end_len - (boundary_end_len - 2) - strlen(content_type_hdr) - strlen(content_dispo) - 12; // 12 is CRLF
+        printf("real size: %zu\n", real_content_len);
+        write(newfd, content_start_ptr, real_content_len);
+        close(newfd);
     } else if(strncmp(content_type, "text", 4) == 0){
         int newfd = open(file_dest, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG);
         if(newfd == -1){
@@ -423,7 +430,7 @@ static _Bool http_get_handler(int connfd, HTTPMsg *msg){
 
     // get content type
     char *req_tgt_path = sb_flush(&req_tgt_path_buf);
-    char *content_type = get_content_type(req_tgt_path);
+    char *content_type = get_content_type_from_path(req_tgt_path);
     if(!content_type){
         http_err_send(connfd, 415, 0);
         free(req_tgt_path);
@@ -629,8 +636,6 @@ static char *sb_flush(Sb *buf){
     size++;
   }
 
-//   ret = strdup(realloc(buf->val, size)); /* using strdup since realloc may remain the same region of memory */
-//   free(buf->val);
   return buf->val;
 }
 
@@ -640,24 +645,26 @@ static void sb_clear(Sb *buf){
     return;
 }
 
-static char *get_content_type(char *req_tgt){
+static char *get_content_type_from_path(char *req_tgt){
     Sb buf;
     sb_init(&buf, 5);
     if(strstr(req_tgt, ".jpg") || strstr(req_tgt, ".png") || strstr(req_tgt, ".jpeg") || strstr(req_tgt, ".ico"))
         sb_puts(&buf, "Content-Type: image/jpeg");
     else if(strstr(req_tgt, ".gif"))
         sb_puts(&buf, "Content-Type: image/gif");
-    else if(strstr(req_tgt, ".docx"))
+    else if(strstr(req_tgt, ".docx") || strstr(req_tgt, ".doc"))
         sb_puts(&buf, "Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     else if(strstr(req_tgt, ".html"))
         sb_puts(&buf, "Content-Type: text/html; charset=utf-8");
     else if(strstr(req_tgt, ".txt")) 
         sb_puts(&buf, "Content-Type: text/plain; charset=utf-8");
-    else if(strstr(req_tgt, "upload"))
+    else if(strstr(req_tgt, ".pdf"))
+        sb_puts(&buf, "Content-Type: application/pdf");
+    else if(strstr(req_tgt, "upload")) // special case
         sb_puts(&buf, "upload");
-    else if(strstr(req_tgt, "download"))
+    else if(strstr(req_tgt, "download")) // special case
         sb_puts(&buf, "download");
-    else if(strstr(req_tgt, "logout"))
+    else if(strstr(req_tgt, "logout")) // special case
         sb_puts(&buf, "logout");
     else // unsupport type
         return NULL;
@@ -782,13 +789,17 @@ static void http_resrc_send(int connfd, int code, char *req_tgt_path, int hdr_cn
     sb_puts(&res_hdr_buf, "Server: cool server");
     sb_puts(&res_hdr_buf, CRLF);
 
-    char *ctt = get_content_type(req_tgt_path);
+    char *ctt = get_content_type_from_path(req_tgt_path);
     sb_puts(&res_hdr_buf, ctt);
     sb_puts(&res_hdr_buf, CRLF);
     free(ctt);
 
     struct stat req_tgt_stat;
     int req_tgt_fd = open(req_tgt_path, O_RDONLY);
+    if(req_tgt_fd == -1){
+        http_err_send(connfd, 400, 0);
+        return; 
+    }
     fstat(req_tgt_fd, &req_tgt_stat);
     sprintf(buf, "%ld", req_tgt_stat.st_size);
     sb_puts(&res_hdr_buf, "Content-Length: ");

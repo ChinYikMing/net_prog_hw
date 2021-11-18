@@ -163,9 +163,9 @@ body {
     <div class="container">
       <button style="background-color: deepskyblue" type="button" onclick="logout()">Logout</button>
       <button type="button" onclick="redirect2view()">View all uploaded file</button>
-      <label for="upload"><b>Click the "Choose File" button to upload a file(maximum 1MB)</b></label>
+      <label for="upload"><b>Click the "Choose File" button to upload a file(maximum 50MB)</b></label>
       <br />
-      <input type="file" name="upload" required accept="text/*,image/*">
+      <input type="file" name="upload" required accept="text/*,image/*,application/*,.c,.py,.doc,.docx,.pdf">
       <button type="submit">Upload</button>
     </div>
   </form>
