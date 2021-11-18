@@ -201,6 +201,7 @@ static int signup(HTTPMsg *msg){
 
     close(shadowfd);
     close(direcfd);
+    closedir(dir_user);
     return 0;
 }
 
@@ -315,7 +316,7 @@ static _Bool http_post_handler(int connfd, HTTPMsg *msg){
 
 static _Bool file_upload(HTTPMsg *msg){
     char *uname = get_uname_from_cookie(get_cookie(msg));
-    char *hdr = sb_flush(&msg->buf);
+    char *hdr = msg->buf.val;
     
     // get content length
     size_t content_len;
@@ -377,10 +378,8 @@ static _Bool file_upload(HTTPMsg *msg){
         strncmp(content_type, "application/pdf", strlen("application/pdf")) == 0 ||
         strncmp(content_type, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", strlen("application/vnd.openxmlformats-officedocument.wordprocessingml.document")) == 0){
         int newfd = open(file_dest, O_TRUNC | O_RDWR | O_CREAT, S_IRWXU | S_IRWXG);
-        if(newfd == -1){
-            free(hdr);
+        if(newfd == -1)
             return false;
-        }
 
         // printf("%s\n", content_dispo);
         // printf("%s\n", content_type_hdr);
@@ -391,10 +390,8 @@ static _Bool file_upload(HTTPMsg *msg){
         close(newfd);
     } else if(strncmp(content_type, "text", 4) == 0){
         int newfd = open(file_dest, O_CREAT | O_TRUNC | O_RDWR, S_IRWXU | S_IRWXG);
-        if(newfd == -1){
-            free(hdr);
+        if(newfd == -1)
             return false;
-        }
 
         ssize_t write_size;
         size_t to_write;
@@ -413,7 +410,6 @@ static _Bool file_upload(HTTPMsg *msg){
         close(newfd);
     } 
 
-    free(hdr);
     return true;
 }
 
@@ -434,6 +430,7 @@ static _Bool http_get_handler(int connfd, HTTPMsg *msg){
     if(!content_type){
         http_err_send(connfd, 415, 0);
         free(req_tgt_path);
+        free(sb_flush(&req_tgt_path_buf));
         return false;
     }
 
@@ -469,6 +466,7 @@ serve:
             strcat(cookie2, "uname=");
             strcat(cookie2, uname);
             strcat(cookie2, "; expires=Thu, 01 Jan 1970 00:00:00 GMT");
+            free(uname);
 
             http_redirect_send(connfd, 303, "/index.html", 2, cookie1, cookie2);
         } else if(strstr(req_tgt_path, "download")){
